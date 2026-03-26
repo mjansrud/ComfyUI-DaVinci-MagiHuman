@@ -15,21 +15,21 @@ MAX_PREVIEW_SIZE = 256
 def latent_to_rgb(latent_frame):
     """Convert a single latent frame [C, H, W] to RGB image [H, W, 3].
 
-    Uses a random but deterministic projection from 48 latent channels to RGB.
-    This gives a rough but consistent visual preview during denoising.
+    Uses the mean of latent channel groups mapped to R/G/B.
+    Channel 0-15 -> R, 16-31 -> G, 32-47 -> B.
     """
     C, H, W = latent_frame.shape
+    latent_frame = latent_frame.float()
 
-    # Deterministic projection matrix (seeded for consistency across steps)
-    gen = torch.Generator(device=latent_frame.device).manual_seed(42)
-    proj = torch.randn(3, C, generator=gen, device=latent_frame.device, dtype=latent_frame.dtype) * 0.1
+    # Split 48 channels into 3 groups of 16, average each for R/G/B
+    group_size = C // 3
+    r = latent_frame[:group_size].mean(dim=0)
+    g = latent_frame[group_size:2*group_size].mean(dim=0)
+    b = latent_frame[2*group_size:3*group_size].mean(dim=0)
 
-    # [C, H, W] -> [H, W, C]
-    x = latent_frame.permute(1, 2, 0).float()
-    # [H, W, C] @ [C, 3] -> [H, W, 3]
-    rgb = F.linear(x, proj)
+    rgb = torch.stack([r, g, b], dim=-1)  # [H, W, 3]
 
-    # Normalize to 0-1
+    # Normalize per-frame to 0-1
     rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
     return rgb
 
