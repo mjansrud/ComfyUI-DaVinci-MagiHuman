@@ -308,9 +308,9 @@ class DaVinciSampler:
             text_tokens, text_coords,
         )
 
-        # Scheduler
+        # Scheduler (matches reference FlowUniPCMultistepScheduler)
         scheduler = FlowMatchingScheduler(shift=shift)
-        sigmas = scheduler.get_sigmas(steps, device=device)
+        scheduler.set_timesteps(steps)
 
         # Keep video and audio tokens separate (different channel dims: 192 vs 64)
         sv = seq_data["video_shape"][0]
@@ -322,15 +322,15 @@ class DaVinciSampler:
         # Handle partial denoising
         if denoise_strength < 1.0:
             start_step = int((1.0 - denoise_strength) * steps)
-            sigma_start = sigmas[start_step]
+            sigma_start = scheduler.sigmas[start_step].item()
             noise_v = torch.randn_like(x_video)
-            x_video = scheduler.add_noise(x_video, noise_v, sigma_start.item())
+            x_video = scheduler.add_noise(x_video, noise_v, sigma_start)
             noise_a = torch.randn_like(x_audio)
-            x_audio = scheduler.add_noise(x_audio, noise_a, sigma_start.item())
+            x_audio = scheduler.add_noise(x_audio, noise_a, sigma_start)
         else:
             start_step = 0
 
-        # Precompute coords and RoPE (constant across steps)
+        # Precompute coords (constant across steps)
         coords = torch.cat([
             seq_data["video_coords"],
             seq_data["audio_coords"],
@@ -341,9 +341,6 @@ class DaVinciSampler:
 
         # Denoising loop
         for i in range(start_step, steps):
-            sigma = sigmas[i].item()
-            sigma_next = sigmas[i + 1].item()
-
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
                 rope_cos, rope_sin = dit.rope(coords)
 
@@ -359,15 +356,15 @@ class DaVinciSampler:
                     seq_data["modality_ids"],
                 )
 
-                # Extract predictions (project back to modality dims)
-                video_pred = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
-                audio_pred = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
+                # Extract velocity predictions (project back to modality dims)
+                video_vel = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
+                audio_vel = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
 
-            # Scheduler step (DDIM for distill)
-            x_video = scheduler.step_ddim(video_pred, sigma, sigma_next, x_video)
-            x_audio = scheduler.step_ddim(audio_pred, sigma, sigma_next, x_audio)
+            # DDIM step: x0 = x_t - sigma*v, then re-noise to next sigma
+            x_video = scheduler.step_ddim(video_vel, i, x_video)
+            x_audio = scheduler.step_ddim(audio_vel, i, x_audio)
 
-            # Live preview: unpatchify current video tokens and show first frame
+            # Live preview
             preview_img = send_preview(
                 x_video, proxy, latent_t, latent_h, latent_w,
                 step=i - start_step, total_steps=steps - start_step,
@@ -480,10 +477,8 @@ class DaVinciSuperResolution:
             text_tokens, text_coords,
         )
 
-        # SR sigma schedule (starting from re-noise level)
-        sigmas = scheduler.get_sigmas(sr_steps, device=device)
-        # Scale sigmas to start from the re-noise sigma
-        sigmas = sigmas * sigma
+        # SR scheduler
+        scheduler.set_timesteps(sr_steps)
 
         # Keep modalities separate (different channel dims)
         sv = seq_data["video_shape"][0]
@@ -501,9 +496,6 @@ class DaVinciSuperResolution:
         pbar = ProgressBar(sr_steps)
 
         for i in range(sr_steps):
-            sig = sigmas[i].item()
-            sig_next = sigmas[i + 1].item()
-
             with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
                 rope_cos, rope_sin = dit.rope(coords)
 
@@ -517,11 +509,11 @@ class DaVinciSuperResolution:
                     seq_data["modality_ids"],
                 )
 
-                video_pred = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
-                audio_pred = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
+                video_vel = dit.final_linear_video(_rms_norm(h[:, :sv], dit.final_norm_video))
+                audio_vel = dit.final_linear_audio(_rms_norm(h[:, sv:sv + sa], dit.final_norm_audio))
 
-            x_video = scheduler.step_ddim(video_pred, sig, sig_next, x_video)
-            x_audio = scheduler.step_ddim(audio_pred, sig, sig_next, x_audio)
+            x_video = scheduler.step_ddim(video_vel, i, x_video)
+            x_audio = scheduler.step_ddim(audio_vel, i, x_audio)
 
             pbar.update(1)
 
