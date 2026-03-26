@@ -167,13 +167,15 @@ class DaVinciT5GemmaLoader:
         torch_dtype = dtype_map[dtype]
 
         model_id = "google/t5gemma-9b-9b-ul2"
-        print(f"[DaVinci] Loading T5Gemma from {model_id} ({dtype})...")
+        cache_dir = os.path.join(folder_paths.models_dir, "t5gemma")
+        print(f"[DaVinci] Loading T5Gemma from {model_id} -> {cache_dir} ({dtype})...")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=cache_dir)
         model = T5GemmaEncoderModel.from_pretrained(
             model_id,
             is_encoder_decoder=False,
             dtype=torch_dtype,
+            cache_dir=cache_dir,
         )
         # Keep on CPU until needed
         model = model.to("cpu")
