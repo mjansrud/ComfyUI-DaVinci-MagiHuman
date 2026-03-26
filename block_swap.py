@@ -13,8 +13,8 @@ import gc
 class BlockSwapManager:
     """Manages CPU<->GPU block swapping for the DiT transformer layers.
 
-    Strategy: Keep N blocks on GPU at a time, swap others to CPU.
-    Uses CUDA streams for async prefetching of the next block.
+    Strategy: Only 1 block on GPU at a time + async prefetch of the next.
+    Between denoising steps, all blocks are evicted to CPU.
     """
 
     def __init__(
@@ -24,13 +24,6 @@ class BlockSwapManager:
         device: torch.device = None,
         offload_device: torch.device = None,
     ):
-        """
-        Args:
-            model: DiTModel with .layers attribute
-            blocks_on_gpu: Number of transformer blocks to keep on GPU simultaneously
-            device: GPU device
-            offload_device: CPU device for offloaded blocks
-        """
         self.model = model
         self.blocks_on_gpu = blocks_on_gpu
         self.device = device or torch.device("cuda")
@@ -57,14 +50,10 @@ class BlockSwapManager:
         self.model.final_linear_video.to(self.device)
         self.model.final_linear_audio.to(self.device)
 
-        # Move all blocks to CPU
-        for i, layer in enumerate(self.model.layers):
-            layer.to(self.offload_device)
+        # Move ALL blocks to CPU
+        for i in range(self.num_layers):
+            self.model.layers[i].to(self.offload_device)
         self._gpu_blocks.clear()
-
-        # Pre-load first N blocks to GPU
-        for i in range(min(self.blocks_on_gpu, self.num_layers)):
-            self._move_to_gpu(i)
 
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
@@ -72,50 +61,22 @@ class BlockSwapManager:
     def _move_to_gpu(self, block_idx: int):
         """Move a block to GPU."""
         if block_idx not in self._gpu_blocks:
-            self.model.layers[block_idx].to(self.device, non_blocking=True)
+            self.model.layers[block_idx].to(self.device)
             self._gpu_blocks.add(block_idx)
 
     def _move_to_cpu(self, block_idx: int):
-        """Move a block to CPU."""
+        """Move a block to CPU (synchronous to ensure memory is freed)."""
         if block_idx in self._gpu_blocks:
-            self.model.layers[block_idx].to(self.offload_device, non_blocking=True)
+            self.model.layers[block_idx].to(self.offload_device)
             self._gpu_blocks.discard(block_idx)
 
-    def prefetch_block(self, block_idx: int):
-        """Async prefetch a block to GPU."""
-        if block_idx >= self.num_layers or block_idx in self._gpu_blocks:
-            return
-
-        if self.prefetch_stream is not None:
-            with torch.cuda.stream(self.prefetch_stream):
-                self._move_to_gpu(block_idx)
-        else:
-            self._move_to_gpu(block_idx)
-
-    def execute_block(self, block_idx: int, *args, **kwargs):
-        """Execute a transformer block with automatic swap management."""
-        # Ensure current block is on GPU
-        if block_idx not in self._gpu_blocks:
-            self._move_to_gpu(block_idx)
-
-        # Sync prefetch stream
-        if self.prefetch_stream is not None:
-            self.prefetch_stream.synchronize()
-
-        # Start prefetching next block
-        next_idx = block_idx + 1
-        if next_idx < self.num_layers:
-            self.prefetch_block(next_idx)
-
-        # Execute the block
-        result = self.model.layers[block_idx](*args, **kwargs)
-
-        # Evict old blocks to stay within budget
-        evict_idx = block_idx - self.blocks_on_gpu + 1
-        if evict_idx >= 0:
-            self._move_to_cpu(evict_idx)
-
-        return result
+    def _evict_all(self):
+        """Move all blocks back to CPU and free VRAM."""
+        for idx in list(self._gpu_blocks):
+            self.model.layers[idx].to(self.offload_device)
+        self._gpu_blocks.clear()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def forward_with_swap(
         self,
@@ -126,17 +87,45 @@ class BlockSwapManager:
         attention_mask: Optional[torch.Tensor] = None,
         callback=None,
     ) -> torch.Tensor:
-        """Run all transformer layers with block swapping."""
+        """Run all transformer layers with block swapping.
+
+        At start: evict any stale blocks from previous call.
+        During: load current block, prefetch next, evict old.
+        At end: last few blocks remain on GPU until next call.
+        """
+        # Evict any stale blocks from previous denoising step
+        self._evict_all()
+
         for i in range(self.num_layers):
-            x = self.execute_block(i, x, rope_cos, rope_sin, modality_ids, attention_mask)
+            # Load current block
+            self._move_to_gpu(i)
+
+            # Sync prefetch from previous iteration
+            if self.prefetch_stream is not None:
+                self.prefetch_stream.synchronize()
+
+            # Prefetch next block asynchronously
+            if i + 1 < self.num_layers:
+                if self.prefetch_stream is not None:
+                    with torch.cuda.stream(self.prefetch_stream):
+                        self._move_to_gpu(i + 1)
+                else:
+                    self._move_to_gpu(i + 1)
+
+            # Execute
+            x = self.model.layers[i](x, rope_cos, rope_sin, modality_ids, attention_mask)
+
+            # Evict current block (keep at most blocks_on_gpu)
+            evict_idx = i - self.blocks_on_gpu + 1
+            if evict_idx >= 0:
+                self._move_to_cpu(evict_idx)
+
             if callback:
                 callback(i, self.num_layers)
+
         return x
 
     def cleanup(self):
         """Move everything back to CPU and free VRAM."""
-        for i in list(self._gpu_blocks):
-            self._move_to_cpu(i)
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
+        self._evict_all()
         gc.collect()
