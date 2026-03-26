@@ -18,6 +18,7 @@ from .turbo_vae import TurboVAEDecoder, load_turbo_vae
 from .scheduler import FlowMatchingScheduler
 from .data_proxy import MagiDataProxy
 from .block_swap import BlockSwapManager
+from .preview import send_preview
 
 # Register model paths
 DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
@@ -366,7 +367,12 @@ class DaVinciSampler:
             x_video = scheduler.step_ddim(video_pred, sigma, sigma_next, x_video)
             x_audio = scheduler.step_ddim(audio_pred, sigma, sigma_next, x_audio)
 
-            pbar.update(1)
+            # Live preview: unpatchify current video tokens and show first frame
+            preview_img = send_preview(
+                x_video, proxy, latent_t, latent_h, latent_w,
+                step=i - start_step, total_steps=steps - start_step,
+            )
+            pbar.update_absolute(i - start_step + 1, steps - start_step, preview_img)
 
         # Extract final tokens
         final_video_tokens = x_video.cpu()
