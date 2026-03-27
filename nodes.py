@@ -348,8 +348,13 @@ class DaVinciSampler:
                 img = img.permute(0, 2, 3, 1)  # [1, H, W, 3]
                 print(f"[DaVinci] Resized ref image to {width}x{height}")
             # ComfyUI VAE.encode expects [B, H, W, C] float32 0-1
-            latent_image = vae.encode(img)  # Returns [B, C, H, W]
-            latent_image = latent_image.unsqueeze(2)  # [1, C, 1, latH, latW] - single frame
+            latent_image = vae.encode(img)
+            print(f"[DaVinci] Raw VAE output: {latent_image.shape}")
+            # ComfyUI Wan2.2 VAE returns [C, 1, 1, H, W] — reshape to [1, C, 1, H, W]
+            if latent_image.dim() == 5 and latent_image.shape[0] != 1 and latent_image.shape[1] == 1:
+                latent_image = latent_image.permute(1, 0, 2, 3, 4)  # [1, C, 1, H, W]
+            elif latent_image.dim() == 4:
+                latent_image = latent_image.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
             latent_image = latent_image.to(torch.float32)
             print(f"[DaVinci] Encoded ref image: {latent_image.shape}")
         elif ref_image is not None:
