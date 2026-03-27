@@ -225,6 +225,9 @@ def run_distill_sampling(
             x = x.to(dtype)
             x = ModalityDispatcher.permute(x, permute_mapping)
 
+            # cp_split_sizes: for single GPU, just [total_seq_len]
+            cp_split_sizes = [x.shape[0]]
+
             # Run transformer blocks with swapping
             for layer_idx in range(swap_manager.num_layers):
                 swap_manager._move_to_gpu(layer_idx)
@@ -238,22 +241,23 @@ def run_distill_sampling(
                     varlen_handler=varlen_handler,
                     local_attn_handler=local_attn_handler,
                     modality_dispatcher=modality_dispatcher,
+                    cp_split_sizes=cp_split_sizes,
                 )
 
                 evict = layer_idx - swap_manager.blocks_on_gpu + 1
                 if evict >= 0:
                     swap_manager._move_to_cpu(evict)
 
-            # Unpermute and output heads
+            # Unpermute and output heads (cast to float32 matching reference post_process_dtype)
             x = ModalityDispatcher.inv_permute(x, inv_permute_mapping)
 
             x_video = x[video_mask].float()
             x_video = model.final_norm_video(x_video)
-            x_video = model.final_linear_video(x_video)
+            x_video = model.final_linear_video.float()(x_video)
 
             x_audio = x[audio_mask].float()
             x_audio = model.final_norm_audio(x_audio)
-            x_audio = model.final_linear_audio(x_audio)
+            x_audio = model.final_linear_audio.float()(x_audio)
 
             # Combine into output tensor for data_proxy.process_output
             x_out = torch.zeros(
@@ -263,6 +267,10 @@ def run_distill_sampling(
             )
             x_out[video_mask, :model.config.video_in_channels] = x_video
             x_out[audio_mask, :model.config.audio_in_channels] = x_audio
+
+            # Restore linear layers back to original dtype
+            model.final_linear_video.to(dtype)
+            model.final_linear_audio.to(dtype)
 
             # Unpack velocity back to latent volumes
             v_video, v_audio = data_proxy.process_output(x_out)
