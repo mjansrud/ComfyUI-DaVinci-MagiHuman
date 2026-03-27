@@ -340,8 +340,14 @@ class DaVinciSampler:
         latent_image = None
         if ref_image is not None and vae is not None:
             print(f"[DaVinci] Encoding reference image {ref_image.shape}...")
-            # ComfyUI VAE.encode expects [B, H, W, C] float32 0-1
+            # Resize image to match target video dimensions
             img = ref_image[0:1]  # [1, H, W, 3]
+            if img.shape[1] != height or img.shape[2] != width:
+                img = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                img = F.interpolate(img, size=(height, width), mode='bilinear', align_corners=False)
+                img = img.permute(0, 2, 3, 1)  # [1, H, W, 3]
+                print(f"[DaVinci] Resized ref image to {width}x{height}")
+            # ComfyUI VAE.encode expects [B, H, W, C] float32 0-1
             latent_image = vae.encode(img)  # Returns [B, C, H, W]
             latent_image = latent_image.unsqueeze(2)  # [1, C, 1, latH, latW] - single frame
             latent_image = latent_image.to(torch.float32)
