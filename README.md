@@ -3,7 +3,7 @@ Im going away on easter holiday and have no time to look at it before im back.
 Feel free to fork it and continue the work, or wait for Kijai to release his version.
 
 The code will (for now) automatically download the required text encoder and wan vae from huggingface, 
-expext it to take some time om the first run.
+expect it to take some time om the first run.
 
 # ComfyUI-DaVinci-MagiHuman
 
