@@ -2,7 +2,7 @@ OBS! This is still work in progress, do not expect it to work.
 Im going away on easter holiday and have no time to look at it before im back.
 Feel free to fork it and continue the work, or wait for Kijai to release his version.
 
-The code will (for now) automatically download the required text encoder and wan vae from huggingface, 
+The code will (for now, will be changed later) automatically download the required text encoder and wan vae from huggingface, 
 expect it to take some time on the first run.
 
 # ComfyUI-DaVinci-MagiHuman
