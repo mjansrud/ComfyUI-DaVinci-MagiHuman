@@ -481,7 +481,7 @@ class DaVinciSuperResolution:
                 "latent": ("DAVINCI_LATENT",),
                 "text_embeds": ("DAVINCI_TEXT_EMBEDS",),
                 "target_width": ("INT", {"default": 1920, "min": 448, "max": 1920, "step": 16}),
-                "target_height": ("INT", {"default": 1088, "min": 256, "max": 1088, "step": 16}),
+                "target_height": ("INT", {"default": 1088, "min": 256, "max": 1920, "step": 16}),
                 "sr_steps": ("INT", {"default": 5, "min": 1, "max": 20, "step": 1}),
                 "noise_value": ("INT", {"default": 220, "min": 0, "max": 999, "step": 1,
                                          "tooltip": "Re-noise level for SR. 220 is default."}),
