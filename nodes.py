@@ -318,9 +318,8 @@ class DaVinciSampler:
             },
             "optional": {
                 "turbo_vae": ("DAVINCI_VAE", {"tooltip": "Connect TurboVAE for real-time decoded preview during sampling."}),
-                "ref_image": ("IMAGE", {"tooltip": "Optional reference image for image-to-video generation. Leave disconnected for text-to-video."}),
-                "samples": ("LATENT", {"tooltip": "Optional initial latents for video-to-video. Leave disconnected for normal generation."}),
-                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V. First frame will match this image."}),
+                "vae": ("VAE", {"tooltip": "ComfyUI VAE (Wan2.2) to encode reference image. Required for I2V."}),
             }
         }
 
@@ -331,11 +330,27 @@ class DaVinciSampler:
 
     def sample(
         self, model, text_embeds, width, height, num_frames, steps, shift, seed,
-        force_offload=True, turbo_vae=None, ref_image=None, samples=None, denoise_strength=1.0,
+        force_offload=True, turbo_vae=None, ref_image=None, vae=None,
     ):
         dit = model["model"]
         swap_manager = model["swap_manager"]
         dtype = model["dtype"]
+
+        # Encode reference image if provided
+        latent_image = None
+        if ref_image is not None and vae is not None:
+            print(f"[DaVinci] Encoding reference image {ref_image.shape}...")
+            # ComfyUI IMAGE format: [B, H, W, C] float32 0-1
+            # VAE expects [B, C, H, W] in [-1, 1]
+            img = ref_image[0:1].permute(0, 3, 1, 2) * 2.0 - 1.0  # [1, 3, H, W]
+            img = img.unsqueeze(2)  # [1, 3, 1, H, W] - single frame as video
+            latent_image = vae.encode(img.to(device))  # [1, C, 1, latH, latW]
+            if hasattr(latent_image, 'latent_dist'):
+                latent_image = latent_image.latent_dist.sample()
+            latent_image = latent_image.to(torch.float32)
+            print(f"[DaVinci] Encoded ref image: {latent_image.shape}")
+        elif ref_image is not None:
+            print("[DaVinci] WARNING: ref_image provided but no VAE connected. Ignoring ref_image.")
 
         # Get text embedding info
         embeds = text_embeds["embeds"]
@@ -393,6 +408,7 @@ class DaVinciSampler:
             device=device,
             dtype=dtype,
             callback=step_callback,
+            latent_image=latent_image,
         )
 
         if force_offload:

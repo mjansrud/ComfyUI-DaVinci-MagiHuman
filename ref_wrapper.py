@@ -149,6 +149,7 @@ def run_distill_sampling(
     device: torch.device = None,
     dtype: torch.dtype = torch.bfloat16,
     callback: Optional[Callable] = None,
+    latent_image: Optional[torch.Tensor] = None,
 ) -> dict:
     """Run distill sampling using reference components.
 
@@ -189,8 +190,17 @@ def run_distill_sampling(
     audio_scheduler.set_timesteps(steps, device="cpu", shift=shift)
     timesteps = video_scheduler.timesteps
 
+    # Move latent_image to device if provided
+    if latent_image is not None:
+        latent_image = latent_image.to(device=device, dtype=torch.float32)
+        print(f"[Ref] I2V mode: latent_image={latent_image.shape}")
+
     # Denoising loop (matching reference evaluate_with_latent for cfg_number=1)
     for idx, t in enumerate(timesteps):
+        # I2V: overwrite first frame with reference image latent (matching reference)
+        if latent_image is not None:
+            latent_video[:, :, :1] = latent_image[:, :, :1]
+
         # Build EvalInput (full latent volumes)
         eval_input = EvalInput(
             x_t=latent_video,
@@ -281,6 +291,10 @@ def run_distill_sampling(
 
         if callback:
             callback(idx, steps, latent_video, latent_audio)
+
+    # Final I2V overwrite (matching reference)
+    if latent_image is not None:
+        latent_video[:, :, :1] = latent_image[:, :, :1]
 
     print(f"[Ref] Done. latent_video={latent_video.shape}, latent_audio={latent_audio.shape}")
 
