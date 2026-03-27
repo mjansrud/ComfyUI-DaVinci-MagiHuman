@@ -340,13 +340,10 @@ class DaVinciSampler:
         latent_image = None
         if ref_image is not None and vae is not None:
             print(f"[DaVinci] Encoding reference image {ref_image.shape}...")
-            # ComfyUI IMAGE format: [B, H, W, C] float32 0-1
-            # VAE expects [B, C, H, W] in [-1, 1]
-            img = ref_image[0:1].permute(0, 3, 1, 2) * 2.0 - 1.0  # [1, 3, H, W]
-            img = img.unsqueeze(2)  # [1, 3, 1, H, W] - single frame as video
-            latent_image = vae.encode(img.to(device))  # [1, C, 1, latH, latW]
-            if hasattr(latent_image, 'latent_dist'):
-                latent_image = latent_image.latent_dist.sample()
+            # ComfyUI VAE.encode expects [B, H, W, C] float32 0-1
+            img = ref_image[0:1]  # [1, H, W, 3]
+            latent_image = vae.encode(img)  # Returns [B, C, H, W]
+            latent_image = latent_image.unsqueeze(2)  # [1, C, 1, latH, latW] - single frame
             latent_image = latent_image.to(torch.float32)
             print(f"[DaVinci] Encoded ref image: {latent_image.shape}")
         elif ref_image is not None:
