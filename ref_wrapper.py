@@ -219,6 +219,9 @@ def run_distill_sampling(
             audio_mask = modality_mapping == Modality.AUDIO
             text_mask = modality_mapping == Modality.TEXT
 
+            # Adapter expects float32 input (creates output_x in float32 internally)
+            x = x.float()
+            coords_mapping = coords_mapping.float()
             x, rope = model.adapter(x, coords_mapping, video_mask, audio_mask, text_mask)
             x = x.to(dtype)
             x = ModalityDispatcher.permute(x, permute_mapping)
