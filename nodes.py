@@ -355,40 +355,26 @@ class DaVinciSampler:
 
         def step_callback(idx, total, latent_video, latent_audio):
             preview_img = None
-            try:
-                from PIL import Image
-                if preview_vae is not None:
-                    # Decode middle frame with TurboVAE for real preview
+            if preview_vae is not None:
+                try:
+                    from PIL import Image
                     mid_t = latent_video.shape[2] // 2
-                    # Take 1 frame: [1, 48, 1, H, W]
                     frame_latent = latent_video[:, :, mid_t:mid_t+1].to(dtype=preview_dtype, device=device)
                     preview_vae.to(device)
                     with torch.no_grad():
                         frame_decoded = preview_vae.decode(frame_latent, output_offload=False).float()
                     preview_vae.to(offload_device)
-                    # [-1,1] -> [0,1] -> uint8
-                    frame_decoded = frame_decoded[0, :, 0]  # [3, H, W]
-                    frame_decoded = frame_decoded.mul(0.5).add(0.5).clamp(0, 1)
-                    frame_decoded = frame_decoded.permute(1, 2, 0)  # [H, W, 3]
+                    frame_decoded = frame_decoded[0, :, 0].mul(0.5).add(0.5).clamp(0, 1)
+                    frame_decoded = frame_decoded.permute(1, 2, 0)
                     rgb_uint8 = (frame_decoded * 255).to(torch.uint8).cpu().numpy()
                     img = Image.fromarray(rgb_uint8)
-                    # Resize for preview
                     w, h = img.size
                     if max(w, h) > 256:
                         scale = 256 / max(w, h)
                         img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
                     preview_img = ("JPEG", img, 256)
-                else:
-                    # Fallback: crude latent channel averaging
-                    from .preview import latent_to_rgb
-                    mid_t = latent_video.shape[2] // 2
-                    frame = latent_video[0, :, mid_t].cpu().float()
-                    rgb = latent_to_rgb(frame)
-                    rgb_uint8 = (rgb.clamp(0, 1) * 255).to(torch.uint8).numpy()
-                    img = Image.fromarray(rgb_uint8)
-                    preview_img = ("JPEG", img, 256)
-            except Exception:
-                pass
+                except Exception as e:
+                    print(f"[DaVinci] Preview error: {e}")
             pbar.update_absolute(idx + 1, total, preview_img)
 
         # Run the reference distill sampling loop
