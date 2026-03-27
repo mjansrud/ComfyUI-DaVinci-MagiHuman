@@ -129,15 +129,9 @@ class RefBlockSwapManager:
 
 
 def create_data_proxy() -> MagiDataProxy:
-    """Create a MagiDataProxy with default configs."""
-    eval_config = EvaluationConfig()
+    """Create a MagiDataProxy with default config."""
     dp_config = DataProxyConfig()
-    model_config = ModelConfig()
-    return MagiDataProxy(
-        eval_config=eval_config,
-        dp_config=dp_config,
-        model_config=model_config,
-    )
+    return MagiDataProxy(config=dp_config)
 
 
 def run_distill_sampling(
