@@ -44,7 +44,7 @@ def _get_wan22_vae(device_target, dtype):
     from inference.model.vae2_2.vae2_2_model import get_vae2_2
 
     # Download Wan2.2 VAE from HuggingFace
-    vae_model_id = "Wan-AI/Wan2.2-T2V-14B"
+    vae_model_id = "Wan-AI/Wan2.2-TI2V-5B"
     cache_dir = os.path.join(folder_paths.models_dir, "wan_vae")
 
     from huggingface_hub import hf_hub_download
