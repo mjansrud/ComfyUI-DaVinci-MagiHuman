@@ -1,4 +1,4 @@
-OBS! This is still work in progress, do not expect it to work 100%. 
+OBS! This is still work in progress, do not expect it to work. 
 Im going away on easter holiday and have no time to look at it before im back.
 Feel free to fork it and continue the work, or wait for Kijai to release his version.
 
