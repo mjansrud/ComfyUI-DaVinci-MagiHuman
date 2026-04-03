@@ -50,15 +50,6 @@ def _encode_ref_image(img, height, width, device_target, dtype, vae):
     """Encode a reference image using provided Wan2.2 VAE (z_dim=48)."""
     vae.to(device_target)
 
-    # Disable torch.compile on the VAE encoder (has @torch.compile that
-    # conflicts with bf16 weights + float input dtype mixing)
-    if hasattr(vae.vae, 'encoder') and hasattr(vae.vae.encoder, '_torchdynamo_orig_callable'):
-        pass  # already unwrapped
-    if hasattr(vae.vae, 'encoder'):
-        vae.vae.encoder.forward = torch._dynamo.disable(vae.vae.encoder.forward)
-    if hasattr(vae.vae, 'decoder'):
-        vae.vae.decoder.forward = torch._dynamo.disable(vae.vae.decoder.forward)
-
     x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
     x = x * 2.0 - 1.0
     x = x.unsqueeze(2)  # [1, 3, 1, H, W]
@@ -244,7 +235,7 @@ class DaVinciT5GemmaLoader:
     CATEGORY = "DaVinci-MagiHuman"
 
     def load(self, model_path, dtype="bf16"):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, BitsAndBytesConfig
         from transformers.models.t5gemma import T5GemmaEncoderModel
 
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
@@ -253,16 +244,21 @@ class DaVinciT5GemmaLoader:
         if not os.path.isdir(model_path):
             raise FileNotFoundError(f"T5Gemma directory not found: {model_path}")
 
-        print(f"[DaVinci] Loading T5Gemma from {model_path} ({dtype})...")
+        print(f"[DaVinci] Loading T5Gemma from {model_path} ({dtype}, INT8 quantized)...")
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
-        model = T5GemmaEncoderModel.from_pretrained(
-            model_path, is_encoder_decoder=False, dtype=torch_dtype,
-        )
-        model = model.to("cpu").eval()
 
-        print(f"[DaVinci] T5Gemma loaded.")
-        return ({"model": model, "tokenizer": tokenizer, "dtype": torch_dtype},)
+        # Load with INT8 quantization via bitsandbytes (~9GB instead of ~18GB)
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        model = T5GemmaEncoderModel.from_pretrained(
+            model_path, is_encoder_decoder=False,
+            quantization_config=quantization_config,
+            device_map="auto",
+        )
+        model.eval()
+
+        print(f"[DaVinci] T5Gemma loaded (INT8).")
+        return ({"model": model, "tokenizer": tokenizer, "dtype": torch_dtype, "quantized": True},)
 
 
 class DaVinciTextEncode:
@@ -301,17 +297,20 @@ class DaVinciTextEncode:
         if t5gemma is not None:
             model = t5gemma["model"]
             tokenizer = t5gemma["tokenizer"]
+            is_quantized = t5gemma.get("quantized", False)
 
             print(f"[DaVinci] Encoding prompt with T5Gemma: {prompt[:80]}...")
 
-            model = model.to(device)
+            if not is_quantized:
+                model = model.to(device)
 
             with torch.no_grad():
                 inputs = tokenizer([prompt], return_tensors="pt").to(device)
                 outputs = model(**inputs)
                 embeds = outputs["last_hidden_state"].float()
 
-            model.to("cpu")
+            if not is_quantized:
+                model.to("cpu")
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
