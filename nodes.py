@@ -1,6 +1,7 @@
 """
 ComfyUI nodes for daVinci-MagiHuman.
 Optimized for RTX 5090 (32GB VRAM) with block-level CPU offloading.
+All models loaded from local paths — no downloads.
 """
 
 import torch
@@ -17,13 +18,11 @@ from .ref_wrapper import (
     load_ref_model, RefBlockSwapManager, create_data_proxy, create_sr_data_proxy,
     run_distill_sampling, run_sr_sampling, EvalInput,
 )
-# Use reference TurboVAE implementation
 import sys as _sys
 _ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref")
 if _ref_path not in _sys.path:
     _sys.path.insert(0, _ref_path)
 from inference.model.turbo_vaed.turbo_vaed_model import get_turbo_vaed
-
 
 # Register model paths
 DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
@@ -31,54 +30,18 @@ DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
-# Cached Wan2.2 VAE for image encoding (loaded on first use)
-_wan22_vae_cache = None
 
-
-def _get_wan22_vae(device_target, dtype):
-    """Load the Wan2.2 VAE (z_dim=48) for encoding reference images."""
-    global _wan22_vae_cache
-    if _wan22_vae_cache is not None:
-        return _wan22_vae_cache
-
-    from inference.model.vae2_2.vae2_2_model import get_vae2_2
-
-    # Download Wan2.2 VAE from HuggingFace
-    vae_model_id = "Wan-AI/Wan2.2-TI2V-5B"
-    cache_dir = os.path.join(folder_paths.models_dir, "wan_vae")
-
-    from huggingface_hub import hf_hub_download
-    print(f"[DaVinci] Downloading Wan2.2 VAE...")
-    vae_path = hf_hub_download(vae_model_id, "Wan2.2_VAE.pth", cache_dir=cache_dir)
-
-    print(f"[DaVinci] Loading Wan2.2 VAE from {vae_path}...")
-    vae = get_vae2_2(vae_path, device="cpu", weight_dtype=dtype)
-    _wan22_vae_cache = vae
-    print(f"[DaVinci] Wan2.2 VAE loaded (z_dim=48).")
-    return vae
-
-
-def _encode_ref_image(img, height, width, device_target, dtype):
-    """Encode a reference image using Wan2.2 VAE (z_dim=48).
-
-    Args:
-        img: [1, H, W, 3] float32 0-1
-
-    Returns:
-        [1, 48, 1, latH, latW] float32 latent
-    """
-    vae = _get_wan22_vae(device_target, dtype)
-    # Move entire VAE including scale tensors to device
+def _encode_ref_image(img, height, width, device_target, dtype, vae):
+    """Encode a reference image using provided Wan2.2 VAE (z_dim=48)."""
     vae.to(device_target)
 
-    # Convert [1, H, W, 3] 0-1 -> [1, 3, 1, H, W] -1..1
     x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
-    x = x * 2.0 - 1.0  # normalize to [-1, 1]
+    x = x * 2.0 - 1.0
     x = x.unsqueeze(2)  # [1, 3, 1, H, W]
     x = x.to(device=device_target, dtype=dtype)
 
     with torch.no_grad():
-        latent = vae.encode(x)  # [1, 48, 1, latH, latW]
+        latent = vae.encode(x)
 
     vae.to("cpu")
     torch.cuda.empty_cache()
@@ -126,7 +89,6 @@ class DaVinciModelLoader:
 
         print(f"[DaVinci] Loading {model_variant} model from {model_dir}...")
 
-        # Check if safetensors files exist (not just LFS pointers)
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:
             index = json.load(f)
@@ -134,17 +96,15 @@ class DaVinciModelLoader:
         for sf in shard_files:
             sp = os.path.join(model_dir, sf)
             if not os.path.exists(sp):
-                raise FileNotFoundError(f"Model shard not found: {sp}. Run git lfs pull to download.")
-            # Check it's not an LFS pointer (< 1KB = pointer file)
+                raise FileNotFoundError(f"Model shard not found: {sp}")
             if os.path.getsize(sp) < 1024:
-                raise FileNotFoundError(f"Model shard is an LFS pointer, not downloaded: {sp}. Run git lfs pull.")
+                raise FileNotFoundError(f"Model shard is an LFS pointer: {sp}. Run git lfs pull.")
 
         pbar = ProgressBar(len(shard_files) + 1)
 
         model = load_ref_model(model_dir, dtype=torch_dtype)
         pbar.update(len(shard_files))
 
-        # Set up block swap manager (reference model: model.block.layers)
         swap_manager = RefBlockSwapManager(
             model=model,
             blocks_on_gpu=blocks_on_gpu,
@@ -154,21 +114,23 @@ class DaVinciModelLoader:
         swap_manager.setup()
         pbar.update(1)
 
-        print(f"[DaVinci] Ref model loaded. {blocks_on_gpu}/{swap_manager.num_layers} blocks on GPU.")
+        print(f"[DaVinci] Model loaded. {blocks_on_gpu}/{swap_manager.num_layers} blocks on GPU.")
 
-        model_data = {
+        return ({
             "model": model,
             "swap_manager": swap_manager,
             "dtype": torch_dtype,
             "variant": model_variant,
             "is_distill": model_variant == "distill",
-        }
-
-        return (model_data,)
+        },)
 
 
 class DaVinciTurboVAELoader:
-    """Load TurboVAE decoder for fast video decoding."""
+    """Load TurboVAE decoder for fast video decoding.
+
+    Expects turbo_vae directory inside models/daVinci-MagiHuman/ with
+    a .json config and .ckpt checkpoint file.
+    """
 
     @classmethod
     def INPUT_TYPES(s):
@@ -191,7 +153,6 @@ class DaVinciTurboVAELoader:
         if not os.path.isdir(vae_dir):
             raise FileNotFoundError(f"TurboVAE directory not found: {vae_dir}")
 
-        # Find config json and checkpoint in turbo_vae dir
         config_path = None
         ckpt_path = None
         for f in os.listdir(vae_dir):
@@ -201,26 +162,106 @@ class DaVinciTurboVAELoader:
                 ckpt_path = os.path.join(vae_dir, f)
 
         if config_path is None or ckpt_path is None:
-            raise FileNotFoundError(f"TurboVAE config or checkpoint not found in {vae_dir}")
+            raise FileNotFoundError(f"TurboVAE config (.json) or checkpoint (.ckpt) not found in {vae_dir}")
 
-        print(f"[DaVinci] Loading TurboVAE from {vae_dir} (reference code)...")
+        print(f"[DaVinci] Loading TurboVAE from {vae_dir}...")
         vae = get_turbo_vaed(config_path, ckpt_path, device="cpu", weight_dtype=torch_dtype)
         print(f"[DaVinci] TurboVAE loaded.")
 
         return ({"vae": vae, "dtype": torch_dtype},)
 
 
-class DaVinciT5GemmaLoader:
-    """Load the T5Gemma-9B text encoder for daVinci-MagiHuman.
+class DaVinciWan22VAELoader:
+    """Load Wan2.2 VAE (z_dim=48) for encoding reference images.
 
-    Downloads google/t5gemma-9b-9b-ul2 from HuggingFace (~18GB in bf16).
-    The encoder is offloaded to CPU after encoding to free VRAM.
+    Point to a local Wan2.2_VAE.pth file. Required for I2V mode.
     """
 
     @classmethod
     def INPUT_TYPES(s):
+        # Scan for .pth files in common locations
+        vae_files = []
+        search_dirs = [
+            os.path.join(folder_paths.models_dir, "wan_vae"),
+            os.path.join(folder_paths.models_dir, "vae"),
+            folder_paths.models_dir,
+        ]
+        for d in search_dirs:
+            if os.path.isdir(d):
+                for f in os.listdir(d):
+                    if f.endswith('.pth') and 'wan' in f.lower():
+                        vae_files.append(os.path.join(d, f))
+        # Also check HF cache structure
+        hf_cache = os.path.join(folder_paths.models_dir, "wan_vae")
+        if os.path.isdir(hf_cache):
+            for root, dirs, files in os.walk(hf_cache):
+                for f in files:
+                    if f.endswith('.pth'):
+                        vae_files.append(os.path.join(root, f))
+
+        if not vae_files:
+            vae_files = ["models/wan_vae/Wan2.2_VAE.pth"]
+
         return {
             "required": {
+                "vae_path": (vae_files, {"tooltip": "Path to Wan2.2_VAE.pth file (z_dim=48)"}),
+                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+            },
+        }
+
+    RETURN_TYPES = ("DAVINCI_WAN_VAE",)
+    RETURN_NAMES = ("wan_vae",)
+    FUNCTION = "load"
+    CATEGORY = "DaVinci-MagiHuman"
+
+    def load(self, vae_path, dtype="bf16"):
+        from inference.model.vae2_2.vae2_2_model import get_vae2_2
+
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        torch_dtype = dtype_map[dtype]
+
+        if not os.path.exists(vae_path):
+            raise FileNotFoundError(f"Wan2.2 VAE not found: {vae_path}")
+
+        print(f"[DaVinci] Loading Wan2.2 VAE from {vae_path}...")
+        vae = get_vae2_2(vae_path, device="cpu", weight_dtype=torch_dtype)
+        print(f"[DaVinci] Wan2.2 VAE loaded (z_dim=48).")
+
+        return ({"vae": vae, "dtype": torch_dtype},)
+
+
+class DaVinciT5GemmaLoader:
+    """Load T5Gemma-9B text encoder from a local directory.
+
+    Point to the directory containing the T5Gemma model files
+    (config.json, tokenizer files, model shards).
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        # Scan for T5Gemma directories
+        t5_dirs = []
+        search_dirs = [
+            os.path.join(folder_paths.models_dir, "t5gemma"),
+            os.path.join(folder_paths.models_dir, "text_encoders"),
+            folder_paths.models_dir,
+        ]
+        for d in search_dirs:
+            if os.path.isdir(d):
+                for sub in os.listdir(d):
+                    full = os.path.join(d, sub)
+                    if os.path.isdir(full) and os.path.exists(os.path.join(full, "config.json")):
+                        t5_dirs.append(full)
+                # Also check if the dir itself has config.json
+                if os.path.exists(os.path.join(d, "config.json")):
+                    t5_dirs.append(d)
+
+        if not t5_dirs:
+            t5_dirs = ["models/t5gemma"]
+
+        return {
+            "required": {
+                "model_path": (t5_dirs, {"tooltip": "Path to T5Gemma model directory"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
             },
         }
@@ -230,27 +271,25 @@ class DaVinciT5GemmaLoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, dtype="bf16"):
+    def load(self, model_path, dtype="bf16"):
         from transformers import AutoTokenizer
         from transformers.models.t5gemma import T5GemmaEncoderModel
 
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
-        model_id = "google/t5gemma-9b-9b-ul2"
-        cache_dir = os.path.join(folder_paths.models_dir, "t5gemma")
-        print(f"[DaVinci] Loading T5Gemma from {model_id} -> {cache_dir} ({dtype})...")
+        if not os.path.isdir(model_path):
+            raise FileNotFoundError(f"T5Gemma model directory not found: {model_path}")
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=cache_dir)
+        print(f"[DaVinci] Loading T5Gemma from {model_path} ({dtype})...")
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = T5GemmaEncoderModel.from_pretrained(
-            model_id,
+            model_path,
             is_encoder_decoder=False,
             dtype=torch_dtype,
-            cache_dir=cache_dir,
         )
-        # Keep on CPU until needed
-        model = model.to("cpu")
-        model.eval()
+        model = model.to("cpu").eval()
 
         print(f"[DaVinci] T5Gemma loaded.")
 
@@ -288,30 +327,25 @@ class DaVinciTextEncode:
     CATEGORY = "DaVinci-MagiHuman"
 
     def encode(self, prompt, max_tokens=640, t5gemma=None):
-        embed_dim = 3584  # T5Gemma output dimension
+        embed_dim = 3584
 
         if t5gemma is not None:
-            # Use the dedicated T5Gemma encoder
             model = t5gemma["model"]
             tokenizer = t5gemma["tokenizer"]
-            torch_dtype = t5gemma["dtype"]
 
             print(f"[DaVinci] Encoding prompt with T5Gemma: {prompt[:80]}...")
 
-            # Move to GPU for encoding
             model = model.to(device)
 
             with torch.no_grad():
                 inputs = tokenizer([prompt], return_tensors="pt").to(device)
                 outputs = model(**inputs)
-                embeds = outputs["last_hidden_state"].float()  # [1, seq_len, 3584]
+                embeds = outputs["last_hidden_state"].float()
 
-            # Move back to CPU to free VRAM
             model.to("cpu")
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            # Pad or truncate to max_tokens
             if embeds.shape[1] < max_tokens:
                 pad = torch.zeros(1, max_tokens - embeds.shape[1], embed_dim,
                                    device=embeds.device, dtype=embeds.dtype)
@@ -322,15 +356,10 @@ class DaVinciTextEncode:
             print(f"[DaVinci] T5Gemma embeddings: {embeds.shape}")
             return ({"embeds": embeds.cpu(), "prompt": prompt},)
 
-        # No T5Gemma: create deterministic prompt-seeded embeddings
-        # This produces unique embeddings per prompt (not random noise)
-        print(f"[DaVinci] Generating built-in text embeddings (connect T5 encoder for best quality)")
+        # Fallback: deterministic prompt-seeded embeddings
+        print(f"[DaVinci] WARNING: No T5Gemma connected. Using placeholder embeddings.")
 
-        # Hash prompt to seed for deterministic results
         prompt_hash = hash(prompt) & 0xFFFFFFFF
-        gen = torch.Generator().manual_seed(prompt_hash)
-
-        # Simple word-level encoding: each word gets a distinct embedding
         words = prompt.lower().split()
         num_words = min(len(words), max_tokens)
 
@@ -340,7 +369,6 @@ class DaVinciTextEncode:
             word_gen = torch.Generator().manual_seed(word_hash)
             embeds[0, i] = torch.randn(embed_dim, generator=word_gen) * 0.5
 
-        # Add positional signal
         positions = torch.arange(max_tokens).float().unsqueeze(1) / max_tokens
         pos_signal = torch.sin(positions * torch.arange(embed_dim).float().unsqueeze(0) * 0.01) * 0.1
         embeds[0] = embeds[0] + pos_signal
@@ -358,11 +386,11 @@ class DaVinciSampler:
                 "model": ("DAVINCI_MODEL",),
                 "text_embeds": ("DAVINCI_TEXT_EMBEDS",),
                 "width": ("INT", {"default": 448, "min": 64, "max": 1920, "step": 16,
-                                   "tooltip": "256p base: 448. Only used for base/distill generation."}),
+                                   "tooltip": "256p base: 448."}),
                 "height": ("INT", {"default": 256, "min": 64, "max": 1088, "step": 16,
-                                    "tooltip": "256p base: 256. Only used for base/distill generation."}),
+                                    "tooltip": "256p base: 256."}),
                 "num_frames": ("INT", {"default": 126, "min": 5, "max": 250, "step": 1,
-                                        "tooltip": "Number of video frames. 125 = 5 seconds at 25fps."}),
+                                        "tooltip": "126 = 5 seconds at 25fps (seconds*fps+1)."}),
                 "steps": ("INT", {"default": 8, "min": 1, "max": 50, "step": 1,
                                    "tooltip": "Distill: 8 steps. Base: 32 steps."}),
                 "shift": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 20.0, "step": 0.1}),
@@ -371,7 +399,8 @@ class DaVinciSampler:
                                                "tooltip": "Move model to CPU after sampling to free VRAM."}),
             },
             "optional": {
-                "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V (must be resized to width x height before connecting)."}),
+                "ref_image": ("IMAGE", {"tooltip": "Reference image for I2V (must match width x height)."}),
+                "wan_vae": ("DAVINCI_WAN_VAE", {"tooltip": "Wan2.2 VAE for encoding ref image. Required for I2V."}),
             }
         }
 
@@ -382,42 +411,38 @@ class DaVinciSampler:
 
     def sample(
         self, model, text_embeds, width, height, num_frames, steps, shift, seed,
-        force_offload=True, ref_image=None,
+        force_offload=True, ref_image=None, wan_vae=None,
     ):
         dit = model["model"]
         swap_manager = model["swap_manager"]
         dtype = model["dtype"]
 
-        # Encode reference image using Wan2.2 VAE (z_dim=48)
+        # Encode reference image if provided
         latent_image = None
         if ref_image is not None:
-            print(f"[DaVinci] Encoding reference image {ref_image.shape}...")
-            img = ref_image[0:1]  # [1, H, W, 3]
+            if wan_vae is None:
+                raise ValueError("Connect a DaVinci Wan2.2 VAE Loader for I2V mode.")
+            img = ref_image[0:1]
             if img.shape[1] != height or img.shape[2] != width:
                 raise ValueError(
                     f"Reference image size ({img.shape[2]}x{img.shape[1]}) doesn't match "
                     f"target video size ({width}x{height}). "
-                    f"Use a Resize/Crop node to match dimensions before connecting."
+                    f"Use a Resize/Crop node to match dimensions."
                 )
-            latent_image = _encode_ref_image(img, height, width, device, dtype)
+            latent_image = _encode_ref_image(img, height, width, device, dtype, wan_vae["vae"])
             print(f"[DaVinci] Encoded ref image: {latent_image.shape}")
 
-        # Get text embedding info
         embeds = text_embeds["embeds"]
-        # Compute actual text length (non-zero tokens)
         text_len = (embeds.abs().sum(-1) > 0).sum(-1).item()
         if text_len == 0:
             text_len = 1
 
-        # Create data proxy using reference code
         data_proxy = create_data_proxy()
-
         pbar = ProgressBar(steps)
 
         def step_callback(idx, total, latent_video, latent_audio):
             pbar.update_absolute(idx + 1, total)
 
-        # Run the reference distill sampling loop
         result = run_distill_sampling(
             model=dit,
             swap_manager=swap_manager,
@@ -446,7 +471,7 @@ class DaVinciSampler:
 
 
 class DaVinciSuperResolution:
-    """Upscale 256p latent to 1080p using the SR model (reference pipeline)."""
+    """Upscale 256p latent to 1080p using the SR model."""
 
     @classmethod
     def INPUT_TYPES(s):
@@ -465,7 +490,8 @@ class DaVinciSuperResolution:
                 "force_offload": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "ref_image": ("IMAGE", {"tooltip": "Same reference image used for base generation. Re-encoded at SR resolution."}),
+                "ref_image": ("IMAGE", {"tooltip": "Same ref image, re-encoded at SR resolution."}),
+                "wan_vae": ("DAVINCI_WAN_VAE", {"tooltip": "Wan2.2 VAE for encoding ref image at SR resolution."}),
             },
         }
 
@@ -475,21 +501,21 @@ class DaVinciSuperResolution:
     CATEGORY = "DaVinci-MagiHuman"
 
     def upscale(self, sr_model, latent, text_embeds, target_width, target_height,
-                sr_steps, noise_value, shift, seed, force_offload=True, ref_image=None):
+                sr_steps, noise_value, shift, seed, force_offload=True, ref_image=None, wan_vae=None):
         dit = sr_model["model"]
         swap_manager = sr_model["swap_manager"]
         dtype = sr_model["dtype"]
 
         # Encode ref image at SR resolution if provided
         sr_latent_image = None
-        if ref_image is not None:
+        if ref_image is not None and wan_vae is not None:
             img = ref_image[0:1]
-            # Resize to SR target dimensions
+            # Resize to SR dimensions
             if img.shape[1] != target_height or img.shape[2] != target_width:
                 img_t = img.permute(0, 3, 1, 2)
                 img_t = F.interpolate(img_t, size=(target_height, target_width), mode='bilinear', align_corners=False)
                 img = img_t.permute(0, 2, 3, 1)
-            sr_latent_image = _encode_ref_image(img, target_height, target_width, device, dtype)
+            sr_latent_image = _encode_ref_image(img, target_height, target_width, device, dtype, wan_vae["vae"])
             print(f"[DaVinci SR] Encoded SR ref image: {sr_latent_image.shape}")
 
         embeds = text_embeds["embeds"]
@@ -558,24 +584,20 @@ class DaVinciDecode:
 
         print(f"[DaVinci] Decoding latent {video_latent.shape}...")
 
-        # Move VAE to GPU
         vae = vae.to(device)
 
         pbar = ProgressBar(1)
 
         with torch.no_grad():
-            # Reference TurboVAED.decode handles normalization internally
             video = vae.decode(video_latent.to(device), output_offload=output_offload).float()
 
         pbar.update(1)
 
-        # Move VAE back to CPU
         vae.to(offload_device)
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Reference output is [-1, 1], convert to [0, 1] (matching reference post_process)
         video = video.cpu()
         video.mul_(0.5).add_(0.5).clamp_(0, 1)
 
@@ -587,135 +609,47 @@ class DaVinciDecode:
         return (video,)
 
 
-class DaVinciVideoOutput:
-    """Save generated video frames to file with optional audio."""
+class DaVinciAudioVAELoader:
+    """Load Stable Audio Open 1.0 VAE for audio decoding.
+
+    Point to a local directory containing model_config.json and model.safetensors
+    from stabilityai/stable-audio-open-1.0.
+    """
 
     @classmethod
     def INPUT_TYPES(s):
+        # Scan for stable audio directories
+        audio_dirs = []
+        search_dirs = [
+            os.path.join(folder_paths.models_dir, "stable_audio"),
+            os.path.join(folder_paths.models_dir, "audio"),
+            folder_paths.models_dir,
+        ]
+        for d in search_dirs:
+            if os.path.isdir(d):
+                for sub in os.listdir(d):
+                    full = os.path.join(d, sub)
+                    if os.path.isdir(full) and os.path.exists(os.path.join(full, "model_config.json")):
+                        audio_dirs.append(full)
+                if os.path.exists(os.path.join(d, "model_config.json")):
+                    audio_dirs.append(d)
+        # Also check HF cache structure
+        for d in search_dirs:
+            if os.path.isdir(d):
+                for root, dirs, files in os.walk(d):
+                    if "model_config.json" in files and "model.safetensors" in files:
+                        audio_dirs.append(root)
+
+        if not audio_dirs:
+            audio_dirs = ["models/stable_audio"]
+
+        # Deduplicate
+        audio_dirs = list(dict.fromkeys(audio_dirs))
+
         return {
             "required": {
-                "frames": ("IMAGE",),
-                "fps": ("INT", {"default": 25, "min": 1, "max": 60}),
-                "filename_prefix": ("STRING", {"default": "davinci"}),
-                "format": (["mp4", "webm"], {"default": "mp4"}),
+                "model_dir": (audio_dirs, {"tooltip": "Directory with model_config.json and model.safetensors"}),
             },
-            "optional": {
-                "audio": ("AUDIO", {"tooltip": "Audio from DaVinci Audio Decode node."}),
-            }
-        }
-
-    RETURN_TYPES = ()
-    OUTPUT_NODE = True
-    FUNCTION = "save"
-    CATEGORY = "DaVinci-MagiHuman"
-
-    def save(self, frames, fps, filename_prefix, format="mp4", audio=None):
-        import subprocess
-        import soundfile as sf
-
-        output_dir = folder_paths.get_output_directory()
-        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
-            filename_prefix, output_dir
-        )
-
-        output_path = os.path.join(full_output_folder, f"{filename}_{counter:05d}.{format}")
-
-        # frames: [T, H, W, 3] float32 0-1
-        T, H, W, C = frames.shape
-
-        print(f"[DaVinci] Saving {T} frames ({W}x{H}) at {fps}fps to {output_path}")
-
-        if format == "mp4":
-            codec = "libx264"
-            pix_fmt = "yuv420p"
-        else:
-            codec = "libvpx-vp9"
-            pix_fmt = "yuv420p"
-
-        # If audio provided, save audio to temp file then mux
-        audio_tmp = None
-        if audio is not None and "waveform" in audio:
-            waveform = audio["waveform"]
-            sample_rate = audio["sample_rate"]
-            if waveform.numel() > 1:
-                audio_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_audio.wav")
-                # [B, channels, samples] -> [samples, channels]
-                wav_np = waveform[0].permute(1, 0).numpy()
-                sf.write(audio_tmp, wav_np, sample_rate)
-                print(f"[DaVinci] Audio saved to temp: {audio_tmp}")
-
-        try:
-            if audio_tmp:
-                # Video + audio mux
-                video_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_video_tmp.{format}")
-                # First encode video
-                cmd_video = [
-                    "ffmpeg", "-y",
-                    "-f", "rawvideo", "-vcodec", "rawvideo",
-                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
-                    "-i", "-",
-                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
-                    video_tmp,
-                ]
-                proc = subprocess.Popen(cmd_video, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                pbar = ProgressBar(T)
-                for i in range(T):
-                    frame = (frames[i].numpy() * 255).astype(np.uint8)
-                    proc.stdin.write(frame.tobytes())
-                    pbar.update(1)
-                proc.stdin.close()
-                proc.wait()
-
-                # Mux video + audio
-                cmd_mux = [
-                    "ffmpeg", "-y",
-                    "-i", video_tmp, "-i", audio_tmp,
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                    "-shortest", output_path,
-                ]
-                subprocess.run(cmd_mux, stderr=subprocess.PIPE)
-                # Cleanup temps
-                os.remove(video_tmp)
-                os.remove(audio_tmp)
-                print(f"[DaVinci] Video+audio saved: {output_path}")
-            else:
-                # Video only
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "rawvideo", "-vcodec", "rawvideo",
-                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
-                    "-i", "-",
-                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
-                    output_path,
-                ]
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                pbar = ProgressBar(T)
-                for i in range(T):
-                    frame = (frames[i].numpy() * 255).astype(np.uint8)
-                    proc.stdin.write(frame.tobytes())
-                    pbar.update(1)
-                proc.stdin.close()
-                proc.wait()
-
-                if proc.returncode != 0:
-                    stderr = proc.stderr.read().decode()
-                    print(f"[DaVinci] FFmpeg error: {stderr}")
-                else:
-                    print(f"[DaVinci] Video saved: {output_path}")
-        except FileNotFoundError:
-            print("[DaVinci] ERROR: ffmpeg not found. Install ffmpeg to save videos.")
-
-        return {"ui": {"videos": [{"filename": f"{filename}_{counter:05d}.{format}",
-                                    "subfolder": subfolder, "type": "output"}]}}
-
-
-class DaVinciAudioVAELoader:
-    """Load Stable Audio Open 1.0 VAE for audio decoding."""
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {},
         }
 
     RETURN_TYPES = ("DAVINCI_AUDIO_VAE",)
@@ -723,25 +657,23 @@ class DaVinciAudioVAELoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self):
+    def load(self, model_dir):
         import sys
-        # Add reference code to path for sa_audio_module
         ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref", "inference", "model", "sa_audio")
         if ref_path not in sys.path:
             sys.path.insert(0, ref_path)
         from sa_audio_module import create_model_from_config
 
-        model_id = "stabilityai/stable-audio-open-1.0"
-        cache_dir = os.path.join(folder_paths.models_dir, "stable_audio")
+        config_path = os.path.join(model_dir, "model_config.json")
+        weights_path = os.path.join(model_dir, "model.safetensors")
 
-        print(f"[DaVinci] Loading Stable Audio VAE from {model_id}...")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"model_config.json not found in {model_dir}")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"model.safetensors not found in {model_dir}")
 
-        # Download model files
-        from huggingface_hub import hf_hub_download
-        config_path = hf_hub_download(model_id, "model_config.json", cache_dir=cache_dir)
-        weights_path = hf_hub_download(model_id, "model.safetensors", cache_dir=cache_dir)
+        print(f"[DaVinci] Loading Stable Audio VAE from {model_dir}...")
 
-        # Load config and build VAE only
         with open(config_path) as f:
             full_config = json.load(f)
 
@@ -756,7 +688,6 @@ class DaVinciAudioVAELoader:
 
         vae_model = create_model_from_config(autoencoder_config)
 
-        # Load only VAE weights from full checkpoint
         from safetensors.torch import load_file
         full_sd = load_file(weights_path, device="cpu")
         vae_sd = {}
@@ -794,20 +725,19 @@ class DaVinciAudioDecode:
         vae = audio_vae["vae"]
         sample_rate = audio_vae["sample_rate"]
 
-        audio_tokens = latent["audio_tokens"]  # [B, num_frames, 64]
+        audio_tokens = latent["audio_tokens"]
         if audio_tokens is None:
             print("[DaVinci] No audio tokens to decode.")
             return ({"waveform": torch.zeros(1, 1, 1), "sample_rate": sample_rate},)
 
         print(f"[DaVinci] Decoding audio latents {audio_tokens.shape}...")
 
-        # Audio latent: [B, T, 64] -> [B, 64, T] for 1D conv decoder
         audio_latent = audio_tokens.float().permute(0, 2, 1)
 
         vae = vae.to(device)
 
         with torch.no_grad():
-            waveform = vae.decode(audio_latent.to(device))  # [B, channels, samples]
+            waveform = vae.decode(audio_latent.to(device))
 
         vae.to(offload_device)
         gc.collect()
@@ -817,14 +747,127 @@ class DaVinciAudioDecode:
         waveform = waveform.cpu().float()
         print(f"[DaVinci] Audio decoded: {waveform.shape}, sample_rate={sample_rate}")
 
-        # ComfyUI AUDIO format: dict with waveform [B, channels, samples] and sample_rate
         return ({"waveform": waveform, "sample_rate": sample_rate},)
+
+
+class DaVinciVideoOutput:
+    """Save generated video frames to file with optional audio."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "frames": ("IMAGE",),
+                "fps": ("INT", {"default": 25, "min": 1, "max": 60}),
+                "filename_prefix": ("STRING", {"default": "davinci"}),
+                "format": (["mp4", "webm"], {"default": "mp4"}),
+            },
+            "optional": {
+                "audio": ("AUDIO", {"tooltip": "Audio from DaVinci Audio Decode node."}),
+            }
+        }
+
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "save"
+    CATEGORY = "DaVinci-MagiHuman"
+
+    def save(self, frames, fps, filename_prefix, format="mp4", audio=None):
+        import subprocess
+        import soundfile as sf
+
+        output_dir = folder_paths.get_output_directory()
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix, output_dir
+        )
+
+        output_path = os.path.join(full_output_folder, f"{filename}_{counter:05d}.{format}")
+
+        T, H, W, C = frames.shape
+
+        print(f"[DaVinci] Saving {T} frames ({W}x{H}) at {fps}fps to {output_path}")
+
+        if format == "mp4":
+            codec = "libx264"
+            pix_fmt = "yuv420p"
+        else:
+            codec = "libvpx-vp9"
+            pix_fmt = "yuv420p"
+
+        audio_tmp = None
+        if audio is not None and "waveform" in audio:
+            waveform = audio["waveform"]
+            sample_rate = audio["sample_rate"]
+            if waveform.numel() > 1:
+                audio_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_audio.wav")
+                wav_np = waveform[0].permute(1, 0).numpy()
+                sf.write(audio_tmp, wav_np, sample_rate)
+
+        try:
+            if audio_tmp:
+                video_tmp = os.path.join(full_output_folder, f"{filename}_{counter:05d}_video_tmp.{format}")
+                cmd_video = [
+                    "ffmpeg", "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
+                    "-i", "-",
+                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
+                    video_tmp,
+                ]
+                proc = subprocess.Popen(cmd_video, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                pbar = ProgressBar(T)
+                for i in range(T):
+                    frame = (frames[i].numpy() * 255).astype(np.uint8)
+                    proc.stdin.write(frame.tobytes())
+                    pbar.update(1)
+                proc.stdin.close()
+                proc.wait()
+
+                cmd_mux = [
+                    "ffmpeg", "-y",
+                    "-i", video_tmp, "-i", audio_tmp,
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                    "-shortest", output_path,
+                ]
+                subprocess.run(cmd_mux, stderr=subprocess.PIPE)
+                os.remove(video_tmp)
+                os.remove(audio_tmp)
+                print(f"[DaVinci] Video+audio saved: {output_path}")
+            else:
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "rawvideo", "-vcodec", "rawvideo",
+                    "-s", f"{W}x{H}", "-pix_fmt", "rgb24", "-r", str(fps),
+                    "-i", "-",
+                    "-c:v", codec, "-pix_fmt", pix_fmt, "-crf", "18",
+                    output_path,
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                pbar = ProgressBar(T)
+                for i in range(T):
+                    frame = (frames[i].numpy() * 255).astype(np.uint8)
+                    proc.stdin.write(frame.tobytes())
+                    pbar.update(1)
+                proc.stdin.close()
+                proc.wait()
+
+                if proc.returncode != 0:
+                    stderr = proc.stderr.read().decode()
+                    print(f"[DaVinci] FFmpeg error: {stderr}")
+                else:
+                    print(f"[DaVinci] Video saved: {output_path}")
+        except FileNotFoundError:
+            print("[DaVinci] ERROR: ffmpeg not found. Install ffmpeg to save videos.")
+
+        return {"ui": {"videos": [{"filename": f"{filename}_{counter:05d}.{format}",
+                                    "subfolder": subfolder, "type": "output"}]}}
 
 
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "DaVinciModelLoader": DaVinciModelLoader,
     "DaVinciTurboVAELoader": DaVinciTurboVAELoader,
+    "DaVinciWan22VAELoader": DaVinciWan22VAELoader,
     "DaVinciT5GemmaLoader": DaVinciT5GemmaLoader,
     "DaVinciTextEncode": DaVinciTextEncode,
     "DaVinciSampler": DaVinciSampler,
@@ -838,6 +881,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DaVinciModelLoader": "DaVinci Model Loader",
     "DaVinciTurboVAELoader": "DaVinci TurboVAE Loader",
+    "DaVinciWan22VAELoader": "DaVinci Wan2.2 VAE Loader",
     "DaVinciT5GemmaLoader": "DaVinci T5Gemma Loader",
     "DaVinciTextEncode": "DaVinci Text Encode",
     "DaVinciSampler": "DaVinci Sampler",
