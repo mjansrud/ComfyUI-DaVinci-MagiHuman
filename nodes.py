@@ -68,8 +68,8 @@ class DaVinciModelLoader:
                 "model_variant": (model_types, {"default": model_types[0] if model_types else "distill"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "blocks_on_gpu": ("INT", {
-                    "default": 8, "min": 1, "max": 40, "step": 1,
-                    "tooltip": "Number of transformer blocks kept on GPU. Lower = less VRAM but slower. 8 works for 32GB."
+                    "default": 40, "min": 1, "max": 40, "step": 1,
+                    "tooltip": "Blocks on GPU. FP8 models: 40 (all). bf16 models: 8 for 32GB VRAM."
                 }),
             },
         }
@@ -79,7 +79,7 @@ class DaVinciModelLoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, model_variant, dtype="bf16", blocks_on_gpu=8):
+    def load(self, model_variant, dtype="bf16", blocks_on_gpu=40):
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
@@ -87,7 +87,7 @@ class DaVinciModelLoader:
         if not os.path.isdir(model_dir):
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
-        print(f"[DaVinci] Loading {model_variant} model from {model_dir}...")
+        print(f"[DaVinci] Loading {model_variant} from {model_dir}...")
 
         index_path = os.path.join(model_dir, "model.safetensors.index.json")
         with open(index_path) as f:

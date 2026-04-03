@@ -7,6 +7,7 @@ Adds block swapping for consumer GPUs (32GB VRAM).
 import sys
 import os
 import torch
+import torch.nn.functional as F
 import gc
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -31,6 +32,26 @@ class EvalInput:
     audio_feat_len: list            # [int] actual audio length
     txt_feat: torch.Tensor          # [B, seq_len, 3584] text embeddings
     txt_feat_len: list              # [int] actual text length
+
+
+def _patch_fp8_linear():
+    """Monkey-patch nn.Linear to handle FP8 weights with dequantization."""
+    import torch.nn as nn
+
+    if getattr(nn.Linear, '_fp8_patched', False):
+        return  # Already patched
+
+    _orig_forward = nn.Linear.forward
+    fp8_dtype = torch.float8_e4m3fn
+
+    def _fp8_linear_forward(self, input):
+        if self.weight.dtype == fp8_dtype and hasattr(self, 'weight_scale'):
+            w = self.weight.to(input.dtype) * self.weight_scale
+            return F.linear(input, w, self.bias)
+        return _orig_forward(self, input)
+
+    nn.Linear.forward = _fp8_linear_forward
+    nn.Linear._fp8_patched = True
 
 
 def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTModel:
@@ -64,6 +85,15 @@ def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTMo
                 state_dict[key] = shard_data[key].to(dtype)
         del shard_data
 
+    # Check if this is a pre-quantized FP8 model
+    scales_path = os.path.join(model_dir, "fp8_scales.json")
+    is_fp8 = os.path.exists(scales_path)
+    fp8_scales = {}
+    if is_fp8:
+        with open(scales_path) as f:
+            fp8_scales = json.load(f)
+        print(f"  FP8 model detected ({len(fp8_scales)} quantized layers)")
+
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     print(f"  Loaded: {len(state_dict)} keys, missing={len(missing)}, unexpected={len(unexpected)}")
     if missing:
@@ -73,10 +103,27 @@ def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTMo
         for k in unexpected[:5]:
             print(f"    unexpected: {k}")
 
-    model = model.to(dtype).eval()
+    # For FP8: apply per-tensor scales to linear layers
+    if is_fp8:
+        _patch_fp8_linear()
+        import torch.nn as nn
+        named_modules = dict(model.named_modules())
+        for key, scale_val in fp8_scales.items():
+            # key is like "block.layers.0.attention.linear_qkv.weight"
+            # module path is everything before ".weight"
+            module_path = key.rsplit(".weight", 1)[0]
+            if module_path in named_modules:
+                mod = named_modules[module_path]
+                if isinstance(mod, nn.Linear):
+                    mod.weight_scale = scale_val
+        param_bytes = sum(p.numel() * p.element_size() for p in model.block.parameters())
+        print(f"  FP8 block VRAM: {param_bytes / 1e9:.1f} GB")
+        # Move non-FP8 parts to proper dtypes
+        model.eval()
+    else:
+        model = model.to(dtype).eval()
 
-    # Reference keeps adapter and output heads in float32 (not bf16)
-    # Adapter has RoPE sin/cos that needs float32 precision
+    # Reference keeps adapter and output heads in float32
     model.adapter.to(torch.float32)
     model.final_norm_video.to(torch.float32)
     model.final_norm_audio.to(torch.float32)
