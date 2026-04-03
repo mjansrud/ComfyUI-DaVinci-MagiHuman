@@ -48,12 +48,14 @@ offload_device = mm.unet_offload_device()
 
 def _encode_ref_image(img, height, width, device_target, dtype, vae):
     """Encode a reference image using provided Wan2.2 VAE (z_dim=48)."""
+    # VAE must run in same dtype as its weights to avoid conv3d type mismatch
+    vae_dtype = next(vae.vae.parameters()).dtype
     vae.to(device_target)
 
     x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
     x = x * 2.0 - 1.0
     x = x.unsqueeze(2)  # [1, 3, 1, H, W]
-    x = x.to(device=device_target, dtype=dtype)
+    x = x.to(device=device_target, dtype=vae_dtype)
 
     with torch.no_grad():
         latent = vae.encode(x)
@@ -75,8 +77,8 @@ class DaVinciModelLoader:
                                {"tooltip": "DiT model .safetensors (supports FP8 quantized)"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "blocks_on_gpu": ("INT", {
-                    "default": 40, "min": 1, "max": 40, "step": 1,
-                    "tooltip": "Blocks on GPU. FP8: 40 (all). bf16: 8 for 32GB."
+                    "default": 8, "min": 1, "max": 40, "step": 1,
+                    "tooltip": "Blocks on GPU. 8 for 32GB VRAM. Higher = faster but more VRAM."
                 }),
             },
         }
