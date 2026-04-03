@@ -50,6 +50,15 @@ def _encode_ref_image(img, height, width, device_target, dtype, vae):
     """Encode a reference image using provided Wan2.2 VAE (z_dim=48)."""
     vae.to(device_target)
 
+    # Disable torch.compile on the VAE encoder (has @torch.compile that
+    # conflicts with bf16 weights + float input dtype mixing)
+    if hasattr(vae.vae, 'encoder') and hasattr(vae.vae.encoder, '_torchdynamo_orig_callable'):
+        pass  # already unwrapped
+    if hasattr(vae.vae, 'encoder'):
+        vae.vae.encoder.forward = torch._dynamo.disable(vae.vae.encoder.forward)
+    if hasattr(vae.vae, 'decoder'):
+        vae.vae.decoder.forward = torch._dynamo.disable(vae.vae.decoder.forward)
+
     x = img.permute(0, 3, 1, 2)  # [1, 3, H, W]
     x = x * 2.0 - 1.0
     x = x.unsqueeze(2)  # [1, 3, 1, H, W]
