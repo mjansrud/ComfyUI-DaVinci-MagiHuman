@@ -23,7 +23,7 @@ _ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref")
 if _ref_path not in _sys.path:
     _sys.path.insert(0, _ref_path)
 from inference.model.turbo_vaed.turbo_vaed_model import get_turbo_vaed
-from .preview import send_preview
+
 
 # Register model paths
 DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
