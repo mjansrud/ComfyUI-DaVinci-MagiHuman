@@ -103,6 +103,34 @@ def quantize_to_fp8(model_dir: str, output_dir: str):
     print(f"\n  Original: {total_orig / 1e9:.1f} GB")
     print(f"  FP8:      {total_fp8 / 1e9:.1f} GB")
     print(f"  Ratio:    {ratio:.1%}")
+
+    # Merge all shards into a single file
+    print(f"\n  Merging shards into single file...")
+    all_tensors = {}
+    for shard_file in sorted(shard_to_keys.keys()):
+        shard_path = os.path.join(output_dir, shard_file)
+        if os.path.exists(shard_path):
+            shard_data = load_file(shard_path, device="cpu")
+            all_tensors.update(shard_data)
+            del shard_data
+
+    single_path = os.path.join(output_dir, "model.safetensors")
+    save_file(all_tensors, single_path)
+    single_size = os.path.getsize(single_path) / 1e9
+    print(f"  Saved single file: {single_path} ({single_size:.1f} GB)")
+
+    # Clean up shards
+    for shard_file in sorted(shard_to_keys.keys()):
+        shard_path = os.path.join(output_dir, shard_file)
+        if os.path.exists(shard_path):
+            os.remove(shard_path)
+    # Remove the index file (no longer needed for single file)
+    idx_path = os.path.join(output_dir, "model.safetensors.index.json")
+    if os.path.exists(idx_path):
+        os.remove(idx_path)
+
+    del all_tensors
+    print(f"  Cleaned up shards.")
     print(f"  Done! Output: {output_dir}")
 
 

@@ -27,6 +27,18 @@ from inference.model.turbo_vaed.turbo_vaed_model import get_turbo_vaed
 # Register model paths
 DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
 
+# Register custom folder paths for file selectors
+folder_paths.folder_names_and_paths["davinci_turbo_vae"] = (
+    [os.path.join(DAVINCI_MODELS_DIR, "turbo_vae")], {".ckpt", ".safetensors", ".pth"}
+)
+folder_paths.folder_names_and_paths["davinci_wan_vae"] = (
+    [os.path.join(folder_paths.models_dir, "wan_vae"),
+     os.path.join(folder_paths.models_dir, "vae")], {".pth", ".safetensors"}
+)
+folder_paths.folder_names_and_paths["davinci_audio_vae"] = (
+    [os.path.join(folder_paths.models_dir, "stable_audio")], {".safetensors"}
+)
+
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
@@ -50,26 +62,44 @@ def _encode_ref_image(img, height, width, device_target, dtype, vae):
 
 
 class DaVinciModelLoader:
-    """Load daVinci-MagiHuman DiT model with VRAM-optimized block swapping."""
+    """Load daVinci-MagiHuman DiT model.
+
+    Supports:
+    - Sharded models (directory with model.safetensors.index.json)
+    - Single .safetensors file (e.g. FP8 quantized)
+    """
 
     @classmethod
     def INPUT_TYPES(s):
-        model_types = []
+        # Scan for model directories (sharded) and single safetensors files
+        model_options = []
         if os.path.isdir(DAVINCI_MODELS_DIR):
             for d in os.listdir(DAVINCI_MODELS_DIR):
                 full = os.path.join(DAVINCI_MODELS_DIR, d)
+                # Sharded model directory
                 if os.path.isdir(full) and os.path.exists(os.path.join(full, "model.safetensors.index.json")):
-                    model_types.append(d)
-        if not model_types:
-            model_types = ["distill", "base", "1080p_sr", "540p_sr"]
+                    model_options.append(d)
+                # Single-file model directory (has model.safetensors + fp8_scales.json)
+                if os.path.isdir(full) and os.path.exists(os.path.join(full, "model.safetensors")) and not os.path.exists(os.path.join(full, "model.safetensors.index.json")):
+                    model_options.append(d)
+
+        # Also scan diffusion_models for single .safetensors files
+        diffusion_dir = os.path.join(folder_paths.models_dir, "diffusion_models")
+        if os.path.isdir(diffusion_dir):
+            for f in os.listdir(diffusion_dir):
+                if f.endswith('.safetensors') and 'davinci' in f.lower():
+                    model_options.append(os.path.join("diffusion_models", f))
+
+        if not model_options:
+            model_options = ["distill", "distill_fp8"]
 
         return {
             "required": {
-                "model_variant": (model_types, {"default": model_types[0] if model_types else "distill"}),
+                "model": (model_options, {"default": model_options[0] if model_options else "distill_fp8"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "blocks_on_gpu": ("INT", {
                     "default": 40, "min": 1, "max": 40, "step": 1,
-                    "tooltip": "Blocks on GPU. FP8 models: 40 (all). bf16 models: 8 for 32GB VRAM."
+                    "tooltip": "Blocks on GPU. FP8: 40 (all). bf16: 8 for 32GB."
                 }),
             },
         }
@@ -79,34 +109,30 @@ class DaVinciModelLoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, model_variant, dtype="bf16", blocks_on_gpu=40):
+    def load(self, model, dtype="bf16", blocks_on_gpu=40):
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
-        model_dir = os.path.join(DAVINCI_MODELS_DIR, model_variant)
-        if not os.path.isdir(model_dir):
-            raise FileNotFoundError(f"Model directory not found: {model_dir}")
+        # Resolve model path
+        if os.path.isabs(model):
+            model_path = model
+        else:
+            model_path = os.path.join(DAVINCI_MODELS_DIR, model)
+            if not os.path.exists(model_path):
+                model_path = os.path.join(folder_paths.models_dir, model)
 
-        print(f"[DaVinci] Loading {model_variant} from {model_dir}...")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
 
-        index_path = os.path.join(model_dir, "model.safetensors.index.json")
-        with open(index_path) as f:
-            index = json.load(f)
-        shard_files = set(index["weight_map"].values())
-        for sf in shard_files:
-            sp = os.path.join(model_dir, sf)
-            if not os.path.exists(sp):
-                raise FileNotFoundError(f"Model shard not found: {sp}")
-            if os.path.getsize(sp) < 1024:
-                raise FileNotFoundError(f"Model shard is an LFS pointer: {sp}. Run git lfs pull.")
+        print(f"[DaVinci] Loading model from {model_path}...")
 
-        pbar = ProgressBar(len(shard_files) + 1)
+        pbar = ProgressBar(2)
 
-        model = load_ref_model(model_dir, dtype=torch_dtype)
-        pbar.update(len(shard_files))
+        model_obj = load_ref_model(model_path, dtype=torch_dtype)
+        pbar.update(1)
 
         swap_manager = RefBlockSwapManager(
-            model=model,
+            model=model_obj,
             blocks_on_gpu=blocks_on_gpu,
             device=device,
             offload_device=offload_device,
@@ -117,25 +143,21 @@ class DaVinciModelLoader:
         print(f"[DaVinci] Model loaded. {blocks_on_gpu}/{swap_manager.num_layers} blocks on GPU.")
 
         return ({
-            "model": model,
+            "model": model_obj,
             "swap_manager": swap_manager,
             "dtype": torch_dtype,
-            "variant": model_variant,
-            "is_distill": model_variant == "distill",
         },)
 
 
 class DaVinciTurboVAELoader:
-    """Load TurboVAE decoder for fast video decoding.
-
-    Expects turbo_vae directory inside models/daVinci-MagiHuman/ with
-    a .json config and .ckpt checkpoint file.
-    """
+    """Load TurboVAE decoder for fast video decoding."""
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
+                "checkpoint": (folder_paths.get_filename_list("davinci_turbo_vae"),
+                               {"tooltip": "TurboVAE checkpoint (.ckpt)"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
             },
         }
@@ -145,26 +167,24 @@ class DaVinciTurboVAELoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, dtype="bf16"):
+    def load(self, checkpoint, dtype="bf16"):
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
-        vae_dir = os.path.join(DAVINCI_MODELS_DIR, "turbo_vae")
-        if not os.path.isdir(vae_dir):
-            raise FileNotFoundError(f"TurboVAE directory not found: {vae_dir}")
+        ckpt_path = folder_paths.get_full_path("davinci_turbo_vae", checkpoint)
+        vae_dir = os.path.dirname(ckpt_path)
 
+        # Find config json in same directory
         config_path = None
-        ckpt_path = None
         for f in os.listdir(vae_dir):
-            if f.endswith('.json') and 'index' not in f:
+            if f.endswith('.json') and 'index' not in f and 'scale' not in f:
                 config_path = os.path.join(vae_dir, f)
-            if f.endswith('.ckpt'):
-                ckpt_path = os.path.join(vae_dir, f)
+                break
 
-        if config_path is None or ckpt_path is None:
-            raise FileNotFoundError(f"TurboVAE config (.json) or checkpoint (.ckpt) not found in {vae_dir}")
+        if config_path is None:
+            raise FileNotFoundError(f"TurboVAE config (.json) not found in {vae_dir}")
 
-        print(f"[DaVinci] Loading TurboVAE from {vae_dir}...")
+        print(f"[DaVinci] Loading TurboVAE: {checkpoint}...")
         vae = get_turbo_vaed(config_path, ckpt_path, device="cpu", weight_dtype=torch_dtype)
         print(f"[DaVinci] TurboVAE loaded.")
 
@@ -172,39 +192,14 @@ class DaVinciTurboVAELoader:
 
 
 class DaVinciWan22VAELoader:
-    """Load Wan2.2 VAE (z_dim=48) for encoding reference images.
-
-    Point to a local Wan2.2_VAE.pth file. Required for I2V mode.
-    """
+    """Load Wan2.2 VAE (z_dim=48) for encoding reference images. Required for I2V."""
 
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for .pth files in common locations
-        vae_files = []
-        search_dirs = [
-            os.path.join(folder_paths.models_dir, "wan_vae"),
-            os.path.join(folder_paths.models_dir, "vae"),
-            folder_paths.models_dir,
-        ]
-        for d in search_dirs:
-            if os.path.isdir(d):
-                for f in os.listdir(d):
-                    if f.endswith('.pth') and 'wan' in f.lower():
-                        vae_files.append(os.path.join(d, f))
-        # Also check HF cache structure
-        hf_cache = os.path.join(folder_paths.models_dir, "wan_vae")
-        if os.path.isdir(hf_cache):
-            for root, dirs, files in os.walk(hf_cache):
-                for f in files:
-                    if f.endswith('.pth'):
-                        vae_files.append(os.path.join(root, f))
-
-        if not vae_files:
-            vae_files = ["models/wan_vae/Wan2.2_VAE.pth"]
-
         return {
             "required": {
-                "vae_path": (vae_files, {"tooltip": "Path to Wan2.2_VAE.pth file (z_dim=48)"}),
+                "vae_file": (folder_paths.get_filename_list("davinci_wan_vae"),
+                             {"tooltip": "Wan2.2_VAE.pth file (z_dim=48)"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
             },
         }
@@ -214,16 +209,14 @@ class DaVinciWan22VAELoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, vae_path, dtype="bf16"):
+    def load(self, vae_file, dtype="bf16"):
         from inference.model.vae2_2.vae2_2_model import get_vae2_2
 
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
-        if not os.path.exists(vae_path):
-            raise FileNotFoundError(f"Wan2.2 VAE not found: {vae_path}")
-
-        print(f"[DaVinci] Loading Wan2.2 VAE from {vae_path}...")
+        vae_path = folder_paths.get_full_path("davinci_wan_vae", vae_file)
+        print(f"[DaVinci] Loading Wan2.2 VAE: {vae_file}...")
         vae = get_vae2_2(vae_path, device="cpu", weight_dtype=torch_dtype)
         print(f"[DaVinci] Wan2.2 VAE loaded (z_dim=48).")
 
@@ -231,37 +224,37 @@ class DaVinciWan22VAELoader:
 
 
 class DaVinciT5GemmaLoader:
-    """Load T5Gemma-9B text encoder from a local directory.
-
-    Point to the directory containing the T5Gemma model files
-    (config.json, tokenizer files, model shards).
-    """
+    """Load T5Gemma-9B text encoder from a local directory."""
 
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for T5Gemma directories
+        # Scan for T5Gemma model directories
         t5_dirs = []
         search_dirs = [
             os.path.join(folder_paths.models_dir, "t5gemma"),
             os.path.join(folder_paths.models_dir, "text_encoders"),
-            folder_paths.models_dir,
         ]
         for d in search_dirs:
             if os.path.isdir(d):
+                # Check subdirs for config.json
                 for sub in os.listdir(d):
                     full = os.path.join(d, sub)
                     if os.path.isdir(full) and os.path.exists(os.path.join(full, "config.json")):
                         t5_dirs.append(full)
-                # Also check if the dir itself has config.json
-                if os.path.exists(os.path.join(d, "config.json")):
-                    t5_dirs.append(d)
+                # Also check HF cache structure (models--google--t5gemma...)
+                for root, dirs, files in os.walk(d):
+                    if "config.json" in files and "tokenizer.json" in files:
+                        t5_dirs.append(root)
+                        break
 
+        # Deduplicate
+        t5_dirs = list(dict.fromkeys(t5_dirs))
         if not t5_dirs:
-            t5_dirs = ["models/t5gemma"]
+            t5_dirs = ["(place T5Gemma model in models/t5gemma/)"]
 
         return {
             "required": {
-                "model_path": (t5_dirs, {"tooltip": "Path to T5Gemma model directory"}),
+                "model_path": (t5_dirs, {"tooltip": "Directory containing T5Gemma model files"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
             },
         }
@@ -279,20 +272,17 @@ class DaVinciT5GemmaLoader:
         torch_dtype = dtype_map[dtype]
 
         if not os.path.isdir(model_path):
-            raise FileNotFoundError(f"T5Gemma model directory not found: {model_path}")
+            raise FileNotFoundError(f"T5Gemma directory not found: {model_path}")
 
         print(f"[DaVinci] Loading T5Gemma from {model_path} ({dtype})...")
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = T5GemmaEncoderModel.from_pretrained(
-            model_path,
-            is_encoder_decoder=False,
-            dtype=torch_dtype,
+            model_path, is_encoder_decoder=False, dtype=torch_dtype,
         )
         model = model.to("cpu").eval()
 
         print(f"[DaVinci] T5Gemma loaded.")
-
         return ({"model": model, "tokenizer": tokenizer, "dtype": torch_dtype},)
 
 
@@ -610,45 +600,14 @@ class DaVinciDecode:
 
 
 class DaVinciAudioVAELoader:
-    """Load Stable Audio Open 1.0 VAE for audio decoding.
-
-    Point to a local directory containing model_config.json and model.safetensors
-    from stabilityai/stable-audio-open-1.0.
-    """
+    """Load Stable Audio Open 1.0 VAE for audio decoding."""
 
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for stable audio directories
-        audio_dirs = []
-        search_dirs = [
-            os.path.join(folder_paths.models_dir, "stable_audio"),
-            os.path.join(folder_paths.models_dir, "audio"),
-            folder_paths.models_dir,
-        ]
-        for d in search_dirs:
-            if os.path.isdir(d):
-                for sub in os.listdir(d):
-                    full = os.path.join(d, sub)
-                    if os.path.isdir(full) and os.path.exists(os.path.join(full, "model_config.json")):
-                        audio_dirs.append(full)
-                if os.path.exists(os.path.join(d, "model_config.json")):
-                    audio_dirs.append(d)
-        # Also check HF cache structure
-        for d in search_dirs:
-            if os.path.isdir(d):
-                for root, dirs, files in os.walk(d):
-                    if "model_config.json" in files and "model.safetensors" in files:
-                        audio_dirs.append(root)
-
-        if not audio_dirs:
-            audio_dirs = ["models/stable_audio"]
-
-        # Deduplicate
-        audio_dirs = list(dict.fromkeys(audio_dirs))
-
         return {
             "required": {
-                "model_dir": (audio_dirs, {"tooltip": "Directory with model_config.json and model.safetensors"}),
+                "weights": (folder_paths.get_filename_list("davinci_audio_vae"),
+                            {"tooltip": "model.safetensors from stable-audio-open-1.0"}),
             },
         }
 
@@ -657,22 +616,21 @@ class DaVinciAudioVAELoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, model_dir):
+    def load(self, weights):
         import sys
         ref_path = os.path.join(os.path.dirname(__file__), "davinci_ref", "inference", "model", "sa_audio")
         if ref_path not in sys.path:
             sys.path.insert(0, ref_path)
         from sa_audio_module import create_model_from_config
 
+        weights_path = folder_paths.get_full_path("davinci_audio_vae", weights)
+        model_dir = os.path.dirname(weights_path)
         config_path = os.path.join(model_dir, "model_config.json")
-        weights_path = os.path.join(model_dir, "model.safetensors")
 
         if not os.path.exists(config_path):
-            raise FileNotFoundError(f"model_config.json not found in {model_dir}")
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"model.safetensors not found in {model_dir}")
+            raise FileNotFoundError(f"model_config.json not found next to {weights_path}")
 
-        print(f"[DaVinci] Loading Stable Audio VAE from {model_dir}...")
+        print(f"[DaVinci] Loading Stable Audio VAE: {weights}...")
 
         with open(config_path) as f:
             full_config = json.load(f)
@@ -680,27 +638,22 @@ class DaVinciAudioVAELoader:
         vae_config = full_config["model"]["pretransform"]["config"]
         sample_rate = full_config["sample_rate"]
 
-        autoencoder_config = {
+        vae_model = create_model_from_config({
             "model_type": "autoencoder",
             "sample_rate": sample_rate,
             "model": vae_config,
-        }
-
-        vae_model = create_model_from_config(autoencoder_config)
+        })
 
         from safetensors.torch import load_file
         full_sd = load_file(weights_path, device="cpu")
-        vae_sd = {}
-        for key, value in full_sd.items():
-            if key.startswith("pretransform.model."):
-                vae_sd[key[len("pretransform.model."):]] = value
+        vae_sd = {k[len("pretransform.model."):]: v
+                  for k, v in full_sd.items() if k.startswith("pretransform.model.")}
         del full_sd
 
         vae_model.load_state_dict(vae_sd)
         vae_model.eval()
 
         print(f"[DaVinci] Stable Audio VAE loaded (sample_rate={sample_rate}).")
-
         return ({"vae": vae_model, "sample_rate": sample_rate},)
 
 

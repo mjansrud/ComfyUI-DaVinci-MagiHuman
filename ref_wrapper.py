@@ -54,39 +54,68 @@ def _patch_fp8_linear():
     nn.Linear._fp8_patched = True
 
 
-def load_ref_model(model_dir: str, dtype: torch.dtype = torch.bfloat16) -> DiTModel:
-    """Load the reference DiTModel from sharded safetensors."""
+def load_ref_model(model_path: str, dtype: torch.dtype = torch.bfloat16) -> DiTModel:
+    """Load the reference DiTModel from safetensors (single file or sharded directory)."""
     import json
     from safetensors.torch import load_file
 
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-    with open(index_path) as f:
-        index = json.load(f)
-
     model_config = ModelConfig()
-    # Computed fields that are normally set by MagiPipelineConfig.post_override_config
     model_config.num_heads_q = model_config.hidden_size // model_config.head_dim
     model_config.num_heads_kv = model_config.num_query_groups
     model = DiTModel(model_config)
 
-    shard_to_keys = {}
-    for key, shard_file in index["weight_map"].items():
-        shard_to_keys.setdefault(shard_file, []).append(key)
+    # Determine if single file or sharded directory
+    if os.path.isfile(model_path) and model_path.endswith('.safetensors'):
+        # Single .safetensors file
+        model_dir = os.path.dirname(model_path)
+        print(f"  Loading single file {os.path.basename(model_path)}...")
+        state_dict = load_file(model_path, device="cpu")
+        # Convert non-FP8 weights to target dtype
+        for key in state_dict:
+            if state_dict[key].dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                state_dict[key] = state_dict[key].to(dtype)
+    elif os.path.isdir(model_path):
+        model_dir = model_path
+        # Check for single model.safetensors (e.g. merged FP8)
+        single_path = os.path.join(model_path, "model.safetensors")
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
 
-    state_dict = {}
-    for shard_file in sorted(shard_to_keys.keys()):
-        shard_path = os.path.join(model_dir, shard_file)
-        if not os.path.exists(shard_path):
-            continue
-        print(f"  Loading {shard_file}...")
-        shard_data = load_file(shard_path, device="cpu")
-        for key in shard_to_keys[shard_file]:
-            if key in shard_data:
-                state_dict[key] = shard_data[key].to(dtype)
-        del shard_data
+        if os.path.exists(single_path) and not os.path.exists(index_path):
+            print(f"  Loading single file model.safetensors...")
+            state_dict = load_file(single_path, device="cpu")
+            for key in state_dict:
+                if state_dict[key].dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    state_dict[key] = state_dict[key].to(dtype)
+        elif os.path.exists(index_path):
+            # Sharded model
+            with open(index_path) as f:
+                index = json.load(f)
+
+            shard_to_keys = {}
+            for key, shard_file in index["weight_map"].items():
+                shard_to_keys.setdefault(shard_file, []).append(key)
+
+            state_dict = {}
+            for shard_file in sorted(shard_to_keys.keys()):
+                shard_path = os.path.join(model_path, shard_file)
+                if not os.path.exists(shard_path):
+                    continue
+                print(f"  Loading {shard_file}...")
+                shard_data = load_file(shard_path, device="cpu")
+                for key in shard_to_keys[shard_file]:
+                    if key in shard_data:
+                        if shard_data[key].dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                            state_dict[key] = shard_data[key].to(dtype)
+                        else:
+                            state_dict[key] = shard_data[key]
+                del shard_data
+        else:
+            raise FileNotFoundError(f"No model.safetensors or index.json found in {model_path}")
+    else:
+        raise FileNotFoundError(f"Model path not found: {model_path}")
 
     # Check if this is a pre-quantized FP8 model
-    scales_path = os.path.join(model_dir, "fp8_scales.json")
+    scales_path = os.path.join(model_dir if os.path.isdir(model_dir) else os.path.dirname(model_path), "fp8_scales.json")
     is_fp8 = os.path.exists(scales_path)
     fp8_scales = {}
     if is_fp8:
