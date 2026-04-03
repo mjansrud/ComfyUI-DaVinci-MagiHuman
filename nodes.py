@@ -28,6 +28,9 @@ from inference.model.turbo_vaed.turbo_vaed_model import get_turbo_vaed
 DAVINCI_MODELS_DIR = os.path.join(folder_paths.models_dir, "daVinci-MagiHuman")
 
 # Register custom folder paths for file selectors
+folder_paths.folder_names_and_paths["davinci_dit"] = (
+    [DAVINCI_MODELS_DIR, os.path.join(folder_paths.models_dir, "diffusion_models")], {".safetensors"}
+)
 folder_paths.folder_names_and_paths["davinci_turbo_vae"] = (
     [os.path.join(DAVINCI_MODELS_DIR, "turbo_vae")], {".ckpt", ".safetensors", ".pth"}
 )
@@ -62,40 +65,14 @@ def _encode_ref_image(img, height, width, device_target, dtype, vae):
 
 
 class DaVinciModelLoader:
-    """Load daVinci-MagiHuman DiT model.
-
-    Supports:
-    - Sharded models (directory with model.safetensors.index.json)
-    - Single .safetensors file (e.g. FP8 quantized)
-    """
+    """Load daVinci-MagiHuman DiT model (.safetensors file)."""
 
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for model directories (sharded) and single safetensors files
-        model_options = []
-        if os.path.isdir(DAVINCI_MODELS_DIR):
-            for d in os.listdir(DAVINCI_MODELS_DIR):
-                full = os.path.join(DAVINCI_MODELS_DIR, d)
-                # Sharded model directory
-                if os.path.isdir(full) and os.path.exists(os.path.join(full, "model.safetensors.index.json")):
-                    model_options.append(d)
-                # Single-file model directory (has model.safetensors + fp8_scales.json)
-                if os.path.isdir(full) and os.path.exists(os.path.join(full, "model.safetensors")) and not os.path.exists(os.path.join(full, "model.safetensors.index.json")):
-                    model_options.append(d)
-
-        # Also scan diffusion_models for single .safetensors files
-        diffusion_dir = os.path.join(folder_paths.models_dir, "diffusion_models")
-        if os.path.isdir(diffusion_dir):
-            for f in os.listdir(diffusion_dir):
-                if f.endswith('.safetensors') and 'davinci' in f.lower():
-                    model_options.append(os.path.join("diffusion_models", f))
-
-        if not model_options:
-            model_options = ["distill", "distill_fp8"]
-
         return {
             "required": {
-                "model": (model_options, {"default": model_options[0] if model_options else "distill_fp8"}),
+                "model_file": (folder_paths.get_filename_list("davinci_dit"),
+                               {"tooltip": "DiT model .safetensors (supports FP8 quantized)"}),
                 "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "blocks_on_gpu": ("INT", {
                     "default": 40, "min": 1, "max": 40, "step": 1,
@@ -109,22 +86,15 @@ class DaVinciModelLoader:
     FUNCTION = "load"
     CATEGORY = "DaVinci-MagiHuman"
 
-    def load(self, model, dtype="bf16", blocks_on_gpu=40):
+    def load(self, model_file, dtype="bf16", blocks_on_gpu=40):
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         torch_dtype = dtype_map[dtype]
 
-        # Resolve model path
-        if os.path.isabs(model):
-            model_path = model
-        else:
-            model_path = os.path.join(DAVINCI_MODELS_DIR, model)
-            if not os.path.exists(model_path):
-                model_path = os.path.join(folder_paths.models_dir, model)
+        model_path = folder_paths.get_full_path("davinci_dit", model_file)
+        # If it's inside a subdirectory, pass the directory (for fp8_scales.json lookup)
+        model_dir = os.path.dirname(model_path)
 
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model not found: {model_path}")
-
-        print(f"[DaVinci] Loading model from {model_path}...")
+        print(f"[DaVinci] Loading model: {model_file}...")
 
         pbar = ProgressBar(2)
 
